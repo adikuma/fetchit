@@ -1,0 +1,85 @@
+{
+  "name": "fetchit",
+  "displayName": "fetchit",
+  "description": "copy project context fast!",
+  "version": "0.0.1",
+  "publisher": "adikuma",
+  "engines": { "vscode": "^1.86.0" },
+  "main": "./extension.js",
+  "icon": "images/fetchit.png",
+  "activationEvents": [
+    "onCommand:fetchit.copyFileFromExplorer",
+    "onCommand:fetchit.copyFolderFromExplorer"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "fetchit.copyFileFromExplorer",
+        "title": "[fetchit] › copy file"
+      },
+      {
+        "command": "fetchit.copyFolderFromExplorer",
+        "title": "[fetchit] › copy folder"
+      }
+    ],  
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "fetchit.copyFileFromExplorer",
+          "when": "!explorerResourceIsFolder",
+          "group": "navigation"
+        },
+        {
+          "command": "fetchit.copyFolderFromExplorer",
+          "when": "explorerResourceIsFolder",
+          "group": "navigation"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "fetchit",
+      "properties": {
+        "fetchit.excludeGlobs": {
+          "type": "array",
+          "default": [
+            "**/.git/**",
+            "**/node_modules/**",
+            "**/__pycache__/**",
+            "**/.venv/**",
+            "**/.mypy_cache/**",
+            "**/.pytest_cache/**",
+            "**/dist/**",
+            "**/build/**",
+            "**/.next/**",
+            "**/.cache/**",
+            "**/*.lock",
+            "**/.DS_Store"
+          ],
+          "description": "extra glob patterns to exclude (applied with .gitignore)."
+        },
+        "fetchit.wrapAsCodeBlock": {
+          "type": "boolean",
+          "default": true,
+          "description": "wrap clipboard output as fenced code blocks with language + relative path."
+        },
+        "fetchit.separator": {
+          "type": "string",
+          "default": "\n\n---\n\n",
+          "description": "separator placed between multiple files when copying."
+        }
+      }
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/adikuma/fetchit.git"
+  },
+  "scripts": {
+    "package": "npx @vscode/vsce package",
+    "publish": "npx @vscode/vsce publish",
+    "login": "npx @vscode/vsce login adikuma"
+  },
+  "dependencies": {
+    "ignore": "^5.3.1"
+  }
+}
