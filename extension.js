@@ -53,6 +53,23 @@ function activate(context) {
 
 function deactivate() {}
 
+// function to ignore binary files
+
+function isBinaryFile(filePath) {
+  const binaryExts = new Set([
+    '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.webp',
+    '.mp4', '.avi', '.mov', '.wmv', '.flv', '.mkv',
+    '.mp3', '.wav', '.flac', '.aac', '.ogg',
+    '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+    '.zip', '.rar', '.7z', '.tar', '.gz',
+    '.exe', '.dll', '.so', '.dylib',
+    '.pyc', '.pyo', '.class'
+  ]);
+  
+  const ext = path.extname(filePath).toLowerCase();
+  return binaryExts.has(ext);
+}
+
 // helper class for ignore rules and copying operations
 // this class is used to collect files under a directory, filtered by ignore rules.
 class CopyHelper {
@@ -60,44 +77,68 @@ class CopyHelper {
     this.igByRoot = new Map();
   }
 
-  // ensure an 'ignore' matcher exists for a workspace root
+  // FIXED: ensure an 'ignore' matcher exists for a workspace root
   async ensureIgnore(rootPath) {
     if (this.igByRoot.has(rootPath)) {
-      return /** @type {import('ignore').Ignore} */ (
-        this.igByRoot.get(rootPath)
-      );
+      return this.igByRoot.get(rootPath);
     }
     const ig = createIgnore();
+  
     const cfgExcludes =
       vscode.workspace.getConfiguration().get("fetchit.excludeGlobs") || [];
     cfgExcludes.forEach((p) => ig.add(p));
-
-    // add root .gitignore
+  
+    const addGitignoreToIg = (filePath) => {
+      try {
+        const content = fs.readFileSync(filePath, "utf8");
+        const dir = path.dirname(filePath);
+        const prefix = path.relative(rootPath, dir).replace(/\\/g, "/");
+    
+        const rules = [];
+        for (const raw of content.split(/\r?\n/)) {
+          const trimmed = raw.trim();
+          if (!trimmed || trimmed.startsWith("#")) continue;
+    
+          let line = trimmed;
+          let neg = false;
+    
+          if (line.startsWith("!")) {
+            neg = true;
+            line = line.slice(1);
+          }
+          if (line.startsWith("/")) {
+            line = line.slice(1);
+          }
+    
+          const withPrefix = prefix ? `${prefix}/${line}` : line;
+          
+          // if pattern ends with /, add both the dir and contents pattern
+          if (line.endsWith("/")) {
+            rules.push(neg ? `!${withPrefix}` : withPrefix);
+            rules.push(neg ? `!${withPrefix}**` : `${withPrefix}**`);
+          } else {
+            rules.push(neg ? `!${withPrefix}` : withPrefix);
+          }
+        }
+        if (rules.length) ig.add(rules);
+      } catch {
+        // ignore read errors
+      }
+    };
+  
+    // root .gitignore
     const rootGitignore = path.join(rootPath, ".gitignore");
-    if (fs.existsSync(rootGitignore)) {
-      const content = fs.readFileSync(rootGitignore, "utf8");
-      ig.add(content.split(/\r?\n/));
-    }
-
-    // add nested .gitignore rules
+    if (fs.existsSync(rootGitignore)) addGitignoreToIg(rootGitignore);
+  
+    // nested .gitignore files
     const nested = await vscode.workspace.findFiles(
       new vscode.RelativePattern(rootPath, "**/.gitignore"),
-      "**/node_modules/**"
+      "{**/node_modules/**,**/.git/**}"
     );
     for (const file of nested) {
-      try {
-        const content = fs.readFileSync(file.fsPath, "utf8");
-        const dir = path.dirname(file.fsPath);
-        const prefix = path.relative(rootPath, dir).replace(/\\/g, "/");
-        const rules = content
-          .split(/\r?\n/)
-          .map((line) => (prefix ? `${prefix}/${line}` : line));
-        ig.add(rules);
-      } catch {
-        // ignore errors
-      }
+      addGitignoreToIg(file.fsPath);
     }
-
+  
     this.igByRoot.set(rootPath, ig);
     return ig;
   }
@@ -111,11 +152,9 @@ class CopyHelper {
     return candidates.filter((uri) => {
       const rel = path.relative(rootPath, uri.fsPath).replace(/\\/g, "/");
       if (ig.ignores(rel)) return false;
-      try {
-        return fs.statSync(uri.fsPath).isFile();
-      } catch {
-        return false;
-      }
+
+      // FIXED: ignore binary files
+      if (isBinaryFile(uri.fsPath)) return false;
     });
   }
 
@@ -172,7 +211,9 @@ class CopyHelper {
   findRootPath(uri) {
     const roots = vscode.workspace.workspaceFolders || [];
     for (const r of roots) {
-      if (uri.fsPath.startsWith(r.uri.fsPath)) {
+      const rel = path.relative(r.uri.fsPath, uri.fsPath);
+      // if relative path doesn't start with "..", uri is under this root
+      if (!rel.startsWith('..') && !path.isAbsolute(rel)) {
         return r.uri.fsPath;
       }
     }
@@ -220,6 +261,11 @@ function languageFromFilename(fp) {
     ".cfg": "ini",
     ".env": "",
     ".txt": "",
+    ".vue": "vue",
+    ".svelte": "svelte", 
+    ".php": "php",
+    ".kt": "kotlin",
+    ".swift": "swift"
   };
   return map[ext] || "";
 }
