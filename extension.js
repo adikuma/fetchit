@@ -14,6 +14,7 @@ function activate(context) {
       "fetchit.copyFileFromExplorer",
       async (uri) => {
         if (!uri) return;
+        helper.igByRoot.clear(); // clear the ignore rules for the current workspace everytime we call the command
         const rootPath = helper.findRootPath(uri);
         if (!rootPath) {
           vscode.window.showErrorMessage(
@@ -21,7 +22,15 @@ function activate(context) {
           );
           return;
         }
-        await helper.copyFiles([uri], rootPath);
+        // NOTE: for single file collect with filtering to match folder behavior
+        const uris = await helper.collectFilesUnder(rootPath, uri);
+        if (!uris.length) {
+          vscode.window.showInformationMessage(
+            "fetchit: file is not copyable (ignored or binary)"
+          );
+          return;
+        }
+        await helper.copyFiles(uris, rootPath);
       }
     ),
 
@@ -31,6 +40,7 @@ function activate(context) {
       "fetchit.copyFolderFromExplorer",
       async (uri) => {
         if (!uri) return;
+        helper.igByRoot.clear(); // clear the ignore rules for the current workspace everytime we call the command
         const rootPath = helper.findRootPath(uri);
         if (!rootPath) {
           vscode.window.showErrorMessage(
@@ -83,53 +93,78 @@ class CopyHelper {
       return this.igByRoot.get(rootPath);
     }
     const ig = createIgnore();
-  
+
     const cfgExcludes =
       vscode.workspace.getConfiguration().get("fetchit.excludeGlobs") || [];
     cfgExcludes.forEach((p) => ig.add(p));
-  
+
     const addGitignoreToIg = (filePath) => {
       try {
         const content = fs.readFileSync(filePath, "utf8");
         const dir = path.dirname(filePath);
         const prefix = path.relative(rootPath, dir).replace(/\\/g, "/");
-    
+
         const rules = [];
         for (const raw of content.split(/\r?\n/)) {
           const trimmed = raw.trim();
           if (!trimmed || trimmed.startsWith("#")) continue;
-    
+
           let line = trimmed;
           let neg = false;
-    
+
           if (line.startsWith("!")) {
             neg = true;
             line = line.slice(1);
           }
-          if (line.startsWith("/")) {
+
+          // check if pattern should only match from current directory (has leading /)
+          const isRootPattern = line.startsWith("/");
+          if (isRootPattern) {
             line = line.slice(1);
           }
-    
-          const withPrefix = prefix ? `${prefix}/${line}` : line;
-          
-          // if pattern ends with /, add both the dir and contents pattern
-          if (line.endsWith("/")) {
-            rules.push(neg ? `!${withPrefix}` : withPrefix);
-            rules.push(neg ? `!${withPrefix}**` : `${withPrefix}**`);
+
+          // check if pattern contains a slash (excluding trailing slash)
+          const hasSlash = line.includes("/") && !line.endsWith("/");
+          let pattern;
+          if (isRootPattern || hasSlash) {
+            // pattern is anchored to the .gitignore location
+            pattern = prefix ? `${prefix}/${line}` : line;
           } else {
-            rules.push(neg ? `!${withPrefix}` : withPrefix);
+            // pattern should match anywhere - add **/ prefix
+            if (prefix) {
+              // for nested .gitignore, make it match anywhere under that directory
+              pattern = `${prefix}/**/${line}`;
+              // also add the pattern for direct match in the gitignore's directory
+              rules.push(neg ? `!${prefix}/${line}` : `${prefix}/${line}`);
+            } else {
+              // for root .gitignore, make it match anywhere
+              pattern = `**/${line}`;
+              // also add the pattern for direct match at root
+              rules.push(neg ? `!${line}` : line);
+            }
           }
-        }
-        if (rules.length) ig.add(rules);
+
+          // handle directory patterns (ending with /)
+          if (line.endsWith("/")) {
+            rules.push(neg ? `!${pattern}` : pattern);
+            rules.push(neg ? `!${pattern}**` : `${pattern}**`);
+          } else {
+            rules.push(neg ? `!${pattern}` : pattern);
+          }
+        } 
+
+        // add all accumulated rules to the ignore instance
+        if (rules.length) ig.add(rules); 
+        
       } catch {
         // ignore read errors
       }
     };
-  
+
     // root .gitignore
     const rootGitignore = path.join(rootPath, ".gitignore");
     if (fs.existsSync(rootGitignore)) addGitignoreToIg(rootGitignore);
-  
+
     // nested .gitignore files
     const nested = await vscode.workspace.findFiles(
       new vscode.RelativePattern(rootPath, "**/.gitignore"),
@@ -138,23 +173,42 @@ class CopyHelper {
     for (const file of nested) {
       addGitignoreToIg(file.fsPath);
     }
-  
+
     this.igByRoot.set(rootPath, ig);
     return ig;
   }
 
-  // collect files under a directory, filtered by ignore rules
-  async collectFilesUnder(rootPath, dirUri) {
+  // FIXED: collect files under a directory (or single file), filtered by ignore rules
+  async collectFilesUnder(rootPath, targetUri) {
     const ig = await this.ensureIgnore(rootPath);
-    const pattern = new vscode.RelativePattern(dirUri.fsPath, "**/*");
+
+    // determine if target is file or folder
+    const stat = await vscode.workspace.fs.stat(targetUri);
+    const isFolder = stat.type === vscode.FileType.Directory;
+
+    let pattern;
+    if (isFolder) {
+      pattern = new vscode.RelativePattern(targetUri.fsPath, "**/*");
+    } else {
+      // for single file, pattern just for that file
+      const rel = path.relative(rootPath, targetUri.fsPath).replace(/\\/g, "/");
+      pattern = new vscode.RelativePattern(rootPath, rel);
+    }
+
     const candidates = await vscode.workspace.findFiles(pattern, undefined);
 
     return candidates.filter((uri) => {
       const rel = path.relative(rootPath, uri.fsPath).replace(/\\/g, "/");
       if (ig.ignores(rel)) return false;
 
-      // FIXED: ignore binary files
+      // ignore binary files
       if (isBinaryFile(uri.fsPath)) return false;
+
+      // skip directories (findFiles includes them if they match pattern)
+      const uriStat = fs.statSync(uri.fsPath);
+      if (uriStat.isDirectory()) return false;
+
+      return true;
     });
   }
 
@@ -169,11 +223,15 @@ class CopyHelper {
       ) || "\n\n---\n\n";
     const parts = [];
 
+    // collect relative paths for notification
+    const relPaths = [];
+
     for (const uri of uris) {
       try {
         const data = await vscode.workspace.fs.readFile(uri);
         const content = new TextDecoder("utf-8").decode(data);
         const rel = this.relativeFor(uri, rootPath);
+        relPaths.push(rel);
         const lang = languageFromFilename(uri.fsPath);
         const chunk = wrap
           ? `# ${rel}\n\n\`\`\`${lang}\n${content}\n\`\`\`\n`
@@ -190,13 +248,21 @@ class CopyHelper {
     }
 
     await vscode.env.clipboard.writeText(parts.join(separator));
-    if (uris.length === 1) {
-      const rel = this.relativeFor(uris[0], rootPath);
-      vscode.window.showInformationMessage(`fetchit: copied ${rel}`);
-    } else {
-      vscode.window.showInformationMessage(
-        `fetchit: copied ${uris.length} files`
-      );
+
+    // ADDED: show notification with option to view file list
+    const message =
+      uris.length === 1
+        ? `fetchit: copied ${relPaths[0]}`
+        : `fetchit: copied ${relPaths.length} files`;
+    const action = await vscode.window.showInformationMessage(
+      message,
+      "View copied files"
+    );
+    if (action === "View copied files") {
+      vscode.window.showQuickPick(relPaths, {
+        title: "Copied Files",
+        placeHolder: "List of copied files",
+      });
     }
   }
 
@@ -207,13 +273,13 @@ class CopyHelper {
     return vscode.workspace.asRelativePath(uri, false).replace(/\\/g, "/");
   }
 
-  // determine which workspace root a uri belongs to
+  // NOTE: determine which workspace root a uri belongs to
   findRootPath(uri) {
     const roots = vscode.workspace.workspaceFolders || [];
     for (const r of roots) {
       const rel = path.relative(r.uri.fsPath, uri.fsPath);
       // if relative path doesn't start with "..", uri is under this root
-      if (!rel.startsWith('..') && !path.isAbsolute(rel)) {
+      if (!rel.startsWith("..") && !path.isAbsolute(rel)) {
         return r.uri.fsPath;
       }
     }
