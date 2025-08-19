@@ -223,21 +223,29 @@ class CopyHelper {
       ) || "\n\n---\n\n";
     const parts = [];
 
-    // collect relative paths for notification
-    const relPaths = [];
+    const copiedFiles = [];
+    let totalLines = 0;
 
     for (const uri of uris) {
       try {
         const data = await vscode.workspace.fs.readFile(uri);
         const content = new TextDecoder("utf-8").decode(data);
         const rel = this.relativeFor(uri, rootPath);
-        relPaths.push(rel);
+        
+        // line count
+        const lineCount = content.split('\n').length;
+        totalLines += lineCount;
+        
+        // NOTE: only add to copiedFiles if we successfully read the file
+        copiedFiles.push({ path: rel, lines: lineCount });
+        
         const lang = languageFromFilename(uri.fsPath);
         const chunk = wrap
           ? `# ${rel}\n\n\`\`\`${lang}\n${content}\n\`\`\`\n`
           : content;
         parts.push(chunk);
-      } catch {
+      } catch (err) {
+        console.error(`fetchit: failed to read ${uri.fsPath}:`, err);
         // skip unreadable files.
       }
     }
@@ -247,33 +255,110 @@ class CopyHelper {
       return;
     }
 
-    await vscode.env.clipboard.writeText(parts.join(separator));
+    // join all parts for final content
+    const finalContent = parts.join(separator);
+    const finalSize = finalContent.length;
+    const sizeMB = (finalSize / (1024 * 1024)).toFixed(2);
+    
+    // first try clipboard, then verify
+    let clipboardSuccess = false;
+    try {
+      await vscode.env.clipboard.writeText(finalContent);
+      
+      // NOTE: verify clipboard write by reading back
+      const verification = await vscode.env.clipboard.readText();
+      if (verification.length >= finalContent.length * 0.9) { // Allow 10% margin
+        clipboardSuccess = true;
+      } else {
+        console.log(`fetchit: Clipboard truncated. Expected ${finalContent.length} chars, got ${verification.length}`);
+      }
+    } catch (clipboardError) {
+      console.error('fetchit: Clipboard write failed:', clipboardError);
+    }
 
-    // ADDED: show notification with option to view file list
+    // if clipboard failed or was truncated then show save option
+    if (!clipboardSuccess) {
+      const action = await vscode.window.showWarningMessage(
+        `fetchit: Clipboard truncated (${copiedFiles.length} files, ${totalLines} lines, ${sizeMB}MB). Save to file instead?`,
+        "Save to File", "Cancel"
+      );
+      
+      if (action === "Save to File") {
+        // NOTE: let user choose where to save
+        const saveUri = await vscode.window.showSaveDialog({
+          defaultUri: vscode.Uri.file(path.join(
+            vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || require('os').homedir(),
+            `fetchit-export-${Date.now()}.md`
+          )),
+          filters: {
+            'Markdown': ['md'],
+            'Text': ['txt'],
+            'All Files': ['*']
+          },
+          saveLabel: 'Save Extracted Content'
+        });
+        
+        if (saveUri) {
+          try {
+            await vscode.workspace.fs.writeFile(
+              saveUri,
+              new TextEncoder().encode(finalContent)
+            );
+            
+            // NOTE: show success with option to open
+            const openAction = await vscode.window.showInformationMessage(
+              `fetchit: Saved ${copiedFiles.length} files (${totalLines} lines) to ${path.basename(saveUri.fsPath)}`,
+              "Open File", "View File List"
+            );
+            
+            if (openAction === "Open File") {
+              await vscode.window.showTextDocument(saveUri);
+            } else if (openAction === "View File List") {
+              const fileList = copiedFiles.map(f => `${f.path} (${f.lines} lines)`);
+              vscode.window.showQuickPick(fileList, {
+                title: `Saved Files (${totalLines} total lines)`,
+                placeHolder: "List of files saved to disk",
+              });
+            }
+          } catch (saveError) {
+            vscode.window.showErrorMessage(
+              `fetchit: Failed to save file: ${saveError.message || 'Unknown error'}`
+            );
+          }
+        }
+      }
+      return;
+    }
+
+    // NOTE: show success message
     const message =
-      uris.length === 1
-        ? `fetchit: copied ${relPaths[0]}`
-        : `fetchit: copied ${relPaths.length} files`;
+      copiedFiles.length === 1
+        ? `fetchit: copied ${copiedFiles[0].path} (${copiedFiles[0].lines} lines)`
+        : `fetchit: copied ${copiedFiles.length} files (${totalLines} total lines)`;
+    
     const action = await vscode.window.showInformationMessage(
       message,
       "View copied files"
     );
+    
     if (action === "View copied files") {
-      vscode.window.showQuickPick(relPaths, {
-        title: "Copied Files",
+      // NOTE: show file list with line counts
+      const fileList = copiedFiles.map(f => `${f.path} (${f.lines} lines)`);
+      vscode.window.showQuickPick(fileList, {
+        title: `Copied Files (${totalLines} total lines)`,
         placeHolder: "List of copied files",
       });
     }
   }
 
-  // produce a clean relative path for display
+  // produce the relative path for display
   relativeFor(uri, rootPath) {
     if (rootPath)
       return path.relative(rootPath, uri.fsPath).replace(/\\/g, "/");
     return vscode.workspace.asRelativePath(uri, false).replace(/\\/g, "/");
   }
 
-  // NOTE: determine which workspace root a uri belongs to
+  // determine which workspace root a uri belongs to
   findRootPath(uri) {
     const roots = vscode.workspace.workspaceFolders || [];
     for (const r of roots) {

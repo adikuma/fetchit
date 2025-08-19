@@ -2,7 +2,7 @@
   "name": "fetchit",
   "displayName": "fetchit",
   "description": "copy project context fast!",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "publisher": "adikuma",
   "engines": { "vscode": "^1.86.0" },
   "main": "./extension.js",
